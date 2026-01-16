@@ -42,7 +42,7 @@ st.markdown("""
     
     /* Espaciado para Modelos 1 y 2 */
     .netflix-spacer {
-        margin-top: 90px;
+        margin-top: 0px;
     }
 
     /* Ajustes para la Sidebar */
