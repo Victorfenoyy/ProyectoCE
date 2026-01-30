@@ -8,7 +8,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 csv_path = os.path.join(BASE_DIR, "movies_with_images.csv")
 df = pd.read_csv(csv_path)
 
-
 df['votes'] = df['votes'].astype(str).str.replace(r'[,\.\s]', '', regex=True)
 df['votes'] = pd.to_numeric(df['votes'], errors='coerce')
 df = df.dropna(subset=['votes'])
@@ -16,6 +15,199 @@ df['Clasificacion'] = pd.to_numeric(df['Clasificacion'], errors='coerce').fillna
 df["Genero"] = df["Genero"].fillna("").astype(str)
 df["duration_min"] = df["Duracion"].str.replace(" min", "", regex=False).astype(float)
 df["Tipo"] = df["Tipo"].str.strip()
+
+# =========================
+# Modelo de IA (entrenado) para recomendaciones
+# =========================
+import numpy as np
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import StandardScaler, MultiLabelBinarizer
+
+try:
+    from scipy.sparse import hstack, csr_matrix
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+
+@st.cache_resource(show_spinner=False)
+def _train_recommender_model(df_in: pd.DataFrame):
+    text = (
+        df_in["Titulo"].fillna("").astype(str) + " " +
+        df_in["Genero"].fillna("").astype(str) + " " +
+        df_in["Tipo"].fillna("").astype(str)
+    ).str.lower()
+
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),
+        min_df=1,
+        max_features=8000
+    )
+    X_text = vectorizer.fit_transform(text)
+
+    num_cols = ["Clasificacion", "votes", "duration_min"]
+    X_num = df_in[num_cols].fillna(0).astype(float).values
+    scaler = StandardScaler()
+    X_num_scaled = scaler.fit_transform(X_num)
+
+    if _HAS_SCIPY:
+        X = hstack([X_text, csr_matrix(X_num_scaled)])
+    else:
+        X = np.hstack([X_text.toarray(), X_num_scaled])
+
+    n_components = 120
+    n_components = int(min(n_components, max(2, min(X_text.shape[0]-1, X_text.shape[1]-1))))
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    X_latent = svd.fit_transform(X)
+
+    norms = np.linalg.norm(X_latent, axis=1, keepdims=True) + 1e-9
+    X_latent = X_latent / norms
+
+    return vectorizer, scaler, svd, X_latent
+
+
+@st.cache_resource(show_spinner=False)
+def _build_genre_matrix(df_in: pd.DataFrame):
+    """
+    Construye una matriz binaria de géneros (MultiLabelBinarizer) para poder
+    controlar el matching de géneros SIN penalizar por 'géneros extra' cuando q_len==1.
+    """
+    def _split_genres(s):
+        if pd.isna(s) or not str(s).strip():
+            return []
+        return [g.strip().lower() for g in str(s).split(",") if g.strip()]
+
+    mlb = MultiLabelBinarizer()
+    genre_lists = df_in["Genero"].apply(_split_genres).tolist()
+    G = mlb.fit_transform(genre_lists).astype(np.int8)  # (n_items, n_genres)
+    return mlb, G
+
+
+def _l2_normalize(vec: np.ndarray) -> np.ndarray:
+    vec = np.asarray(vec, dtype=float)
+    n = float(np.linalg.norm(vec) + 1e-9)
+    return vec / n
+
+
+def _embed_query(genres, content_type, vectorizer, scaler, svd) -> np.ndarray:
+    q_text = (" ".join([str(g) for g in genres]) + " " + str(content_type)).strip().lower()
+
+    q_text_vec = vectorizer.transform([q_text])
+
+    q_num = scaler.mean_.reshape(1, -1)
+    q_num_scaled = scaler.transform(q_num)
+
+    if _HAS_SCIPY:
+        q_vec = hstack([q_text_vec, csr_matrix(q_num_scaled)])
+    else:
+        q_vec = np.hstack([q_text_vec.toarray(), q_num_scaled])
+
+    q_lat = svd.transform(q_vec)[0]
+    return _l2_normalize(q_lat)
+
+
+def _minmax(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    if x.size == 0:
+        return x
+    mn = np.min(x)
+    mx = np.max(x)
+    den = (mx - mn) if (mx - mn) != 0 else 1.0
+    return (x - mn) / den
+
+
+def _recommend_genre_priority(
+    df_in: pd.DataFrame,
+    item_embeddings: np.ndarray,
+    user_vec: np.ndarray,
+    mlb: MultiLabelBinarizer,
+    G: np.ndarray,
+    query_genres,
+    final_n: int,
+    pool_size: int = 800,
+    exclude_titles=None,
+    filter_mask=None,
+    w_genre: float = 0.30,
+    w_sim: float = 0.60,
+    w_rating: float = 0.05,
+    w_votes: float = 0.05,
+) -> pd.DataFrame:
+
+    if exclude_titles is None:
+        exclude_titles = set()
+
+    sims_all = item_embeddings @ user_vec
+
+    valid = np.ones(len(df_in), dtype=bool)
+    if exclude_titles:
+        valid &= ~df_in["Titulo"].isin(list(exclude_titles)).values
+    if filter_mask is not None:
+        valid &= filter_mask.values if isinstance(filter_mask, pd.Series) else np.asarray(filter_mask, dtype=bool)
+
+    sims_masked = sims_all.copy()
+    sims_masked[~valid] = -1e9
+
+    k = int(min(pool_size, int(np.sum(valid)))) if np.sum(valid) > 0 else 0
+    if k <= 0:
+        return df_in.head(0)
+
+    pool_idx = np.argsort(-sims_masked)[:k]
+    pool = df_in.iloc[pool_idx].copy()
+
+    # 2) Score de géneros con lógica explícita
+    q = [str(g).strip().lower() for g in (query_genres or []) if str(g).strip()]
+    q_vec_bin = np.zeros(len(mlb.classes_), dtype=np.int8)
+    class_to_i = {c: i for i, c in enumerate(mlb.classes_)}
+
+    for g in q:
+        if g in class_to_i:
+            q_vec_bin[class_to_i[g]] = 1
+
+    q_len = int(q_vec_bin.sum())
+
+    if q_len == 0:
+        genre_score = np.zeros(len(pool_idx), dtype=float)
+    else:
+        overlap = (G[pool_idx] @ q_vec_bin).astype(float)
+
+        if q_len == 1:
+            # clave: no penaliza tener más géneros
+            genre_score = (overlap > 0).astype(float)
+        else:
+            coverage = overlap / q_len
+            exact = (overlap == q_len).astype(float)
+            genre_score = coverage + 0.25 * exact  # bonus por match completo
+
+    # 3) Normalizaciones dentro del pool
+    pool_sim = _minmax(sims_all[pool_idx])
+    pool_rating = _minmax(pool["Clasificacion"].fillna(0).astype(float).values)
+    pool_votes = _minmax(np.log1p(pool["votes"].fillna(0).astype(float).values))
+
+    # 4) Score para seleccionar TOP relevante (NO es el orden final)
+    score = (
+        w_genre * genre_score +
+        w_sim * pool_sim +
+        w_rating * pool_rating +
+        w_votes * pool_votes
+    )
+
+    pool["_score"] = score
+
+    # A) Selección: nos quedamos con los mejores por score (relevancia)
+    pool = pool.sort_values(by=["_score"], ascending=False).head(final_n).copy()
+
+    # B) ORDEN FINAL (lo que se muestra): por Clasificacion y votes
+    pool = pool.sort_values(by=["Clasificacion", "votes"], ascending=False)
+
+    return pool.drop(columns=["_score"])
+
+
+# Entrenamos modelo y matriz de géneros (cacheado)
+_vectorizer, _scaler, _svd, _ITEM_EMB = _train_recommender_model(df)
+_mlb, _G = _build_genre_matrix(df)
+
 
 st.markdown("""
     <style>
@@ -118,7 +310,19 @@ if page == "Recomendación por gustos":
         if content_type == "Pelicula":
             filtered = filtered[filtered["duration_min"] >= user_min_duration]
             
-        recs = filtered.sort_values(by="Clasificacion", ascending=False).head(10)
+        q_vec = _embed_query(user_genres, content_type, _vectorizer, _scaler, _svd)
+
+        recs = _recommend_genre_priority(
+            filtered,
+            _ITEM_EMB[filtered.index],
+            q_vec,
+            _mlb,
+            _G[filtered.index],
+            user_genres,
+            final_n=10,
+            pool_size=400
+        )
+
         st.subheader("Títulos recomendados:")
         for _, row in recs.iterrows():
             col1, col2 = st.columns([1, 3])
@@ -141,16 +345,37 @@ elif page == "Recomendación por Usuario":
         watched_df = df[df["Titulo"].isin(watched_titles)]
         genres_watched = set()
         for g in watched_df["Genero"].dropna():
-            for genre in g.split(","): genres_watched.add(genre.strip())
+            for genre in g.split(","):
+                genres_watched.add(genre.strip())
         
         preferred_type = watched_df["Tipo"].mode()[0]
         pattern = "|".join(genres_watched) if genres_watched else ""
         
-        recommendations = df[
-            (~df["Titulo"].isin(watched_titles)) & 
-            (df["Tipo"] == preferred_type) & 
+        watched_idx = df[df["Titulo"].isin(watched_titles)].index
+        if len(watched_idx) > 0:
+            user_vec = _ITEM_EMB[watched_idx].mean(axis=0)
+            user_vec = _l2_normalize(user_vec)
+        else:
+            user_vec = _embed_query(genres_watched, preferred_type, _vectorizer, _scaler, _svd)
+
+        candidate_mask = (
+            (df["Tipo"] == preferred_type) &
+            (~df["Titulo"].isin(watched_titles)) &
             (df["Genero"].str.contains(pattern, case=False, na=False) if pattern else True)
-        ].sort_values(by="Clasificacion", ascending=False).head(10)
+        )
+
+        recommendations = _recommend_genre_priority(
+            df,
+            _ITEM_EMB,
+            user_vec,
+            _mlb,
+            _G,
+            list(genres_watched),
+            final_n=10,
+            pool_size=500,
+            exclude_titles=set(watched_titles),
+            filter_mask=candidate_mask
+        )
 
         for _, row in recommendations.iterrows():
             col1, col2 = st.columns([1, 3])
@@ -192,29 +417,91 @@ elif page == "Recomendación por Match":
                 st.rerun()
 
     exclude = [item["Titulo"]] if item is not None else [""]
-    if st.session_state.last_match is not None: exclude.append(st.session_state.last_match["Titulo"])
+    if st.session_state.last_match is not None:
+        exclude.append(st.session_state.last_match["Titulo"])
 
     def render_rec_detailed(row):
         sc1, sc2 = st.columns([1.2, 2])
         with sc1: st.image(row["link"], use_container_width=True)
         with sc2:
             st.markdown(f"<p class='rec-title'>{row['Titulo']}</p>", unsafe_allow_html=True)
-            st.markdown(f"<p class='rec-info'>{row['Genero']}<br>⭐ {row['Clasificacion']} | 🗳️ {int(row['votes'])}</p>", unsafe_allow_html=True)
+            st.markdown(
+                f"<p class='rec-info'>{row['Genero']}<br>⭐ {row['Clasificacion']} | 🗳️ {int(row['votes'])}</p>",
+                unsafe_allow_html=True
+            )
         st.divider()
 
     with c2:
         st.markdown("<h3 style='text-align: center;'>Populares</h3>", unsafe_allow_html=True)
         if st.session_state.liked_genres:
             pattern = "|".join(st.session_state.liked_genres)
-            recs = df[(df["Genero"].str.contains(pattern, case=False, na=False)) & (~df["Titulo"].isin(exclude)) & (df["votes"] >= 350)].sort_values(by="Clasificacion", ascending=False).head(5)
-            for _, r in recs.iterrows(): render_rec_detailed(r)
+
+            if st.session_state.last_match is not None:
+                base_title = st.session_state.last_match["Titulo"]
+                base_idx = df.index[df["Titulo"] == base_title]
+                base_vec = _ITEM_EMB[base_idx[0]] if len(base_idx) > 0 else _embed_query(
+                    st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd
+                )
+            else:
+                base_vec = _embed_query(st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd)
+
+            cand_mask = (
+                (df["Genero"].str.contains(pattern, case=False, na=False)) &
+                (~df["Titulo"].isin(exclude)) &
+                (df["votes"] >= 350)
+            )
+
+            recs = _recommend_genre_priority(
+                df,
+                _ITEM_EMB,
+                base_vec,
+                _mlb,
+                _G,
+                list(st.session_state.liked_genres),
+                final_n=5,
+                pool_size=400,
+                exclude_titles=set(exclude),
+                filter_mask=cand_mask
+            )
+
+            for _, r in recs.iterrows():
+                render_rec_detailed(r)
 
     with c3:
         st.markdown("<h3 style='text-align: center;'>Joyas Desconicidas</h3>", unsafe_allow_html=True)
         if st.session_state.liked_genres:
             pattern = "|".join(st.session_state.liked_genres)
-            recs = df[(df["Genero"].str.contains(pattern, case=False, na=False)) & (~df["Titulo"].isin(exclude)) & (df["votes"] < 350)].sort_values(by="Clasificacion", ascending=False).head(5)
-            for _, r in recs.iterrows(): render_rec_detailed(r)
+
+            if st.session_state.last_match is not None:
+                base_title = st.session_state.last_match["Titulo"]
+                base_idx = df.index[df["Titulo"] == base_title]
+                base_vec = _ITEM_EMB[base_idx[0]] if len(base_idx) > 0 else _embed_query(
+                    st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd
+                )
+            else:
+                base_vec = _embed_query(st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd)
+
+            cand_mask = (
+                (df["Genero"].str.contains(pattern, case=False, na=False)) &
+                (~df["Titulo"].isin(exclude)) &
+                (df["votes"] < 350)
+            )
+
+            recs = _recommend_genre_priority(
+                df,
+                _ITEM_EMB,
+                base_vec,
+                _mlb,
+                _G,
+                list(st.session_state.liked_genres),
+                final_n=5,
+                pool_size=400,
+                exclude_titles=set(exclude),
+                filter_mask=cand_mask
+            )
+
+            for _, r in recs.iterrows():
+                render_rec_detailed(r)
 
     with c4:
         st.markdown("<h3 style='text-align: center;'>Match con</h3>", unsafe_allow_html=True)
