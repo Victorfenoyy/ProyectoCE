@@ -72,8 +72,7 @@ def _train_recommender_model(df_in: pd.DataFrame):
 @st.cache_resource(show_spinner=False)
 def _build_genre_matrix(df_in: pd.DataFrame):
     """
-    Construye una matriz binaria de géneros (MultiLabelBinarizer) para poder
-    controlar el matching de géneros SIN penalizar por 'géneros extra' cuando q_len==1.
+    Construye una matriz binaria de géneros (MultiLabelBinarizer).
     """
     def _split_genres(s):
         if pd.isna(s) or not str(s).strip():
@@ -139,8 +138,10 @@ def _recommend_genre_priority(
     if exclude_titles is None:
         exclude_titles = set()
 
+    # 1) Similitud coseno (porque embeddings están normalizados)
     sims_all = item_embeddings @ user_vec
 
+    # 2) Máscara válida (solo para excluir títulos vistos / mostrados)
     valid = np.ones(len(df_in), dtype=bool)
     if exclude_titles:
         valid &= ~df_in["Titulo"].isin(list(exclude_titles)).values
@@ -150,6 +151,7 @@ def _recommend_genre_priority(
     sims_masked = sims_all.copy()
     sims_masked[~valid] = -1e9
 
+    # 3) Pool TOP-K por similitud (acelera y mantiene relevancia)
     k = int(min(pool_size, int(np.sum(valid)))) if np.sum(valid) > 0 else 0
     if k <= 0:
         return df_in.head(0)
@@ -157,7 +159,7 @@ def _recommend_genre_priority(
     pool_idx = np.argsort(-sims_masked)[:k]
     pool = df_in.iloc[pool_idx].copy()
 
-    # 2) Score de géneros con lógica explícita
+    # 4) Score de géneros
     q = [str(g).strip().lower() for g in (query_genres or []) if str(g).strip()]
     q_vec_bin = np.zeros(len(mlb.classes_), dtype=np.int8)
     class_to_i = {c: i for i, c in enumerate(mlb.classes_)}
@@ -178,14 +180,14 @@ def _recommend_genre_priority(
         else:
             coverage = overlap / q_len
             exact = (overlap == q_len).astype(float)
-            genre_score = coverage + 0.25 * exact  # bonus por match completo
+            genre_score = coverage + 0.25 * exact
 
-    # 3) Normalizaciones dentro del pool
+    # 5) Normalizaciones (para mezclar señales)
     pool_sim = _minmax(sims_all[pool_idx])
     pool_rating = _minmax(pool["Clasificacion"].fillna(0).astype(float).values)
     pool_votes = _minmax(np.log1p(pool["votes"].fillna(0).astype(float).values))
 
-    # 4) Score para seleccionar TOP relevante (NO es el orden final)
+    # 6) Score final (selección TOP relevante)
     score = (
         w_genre * genre_score +
         w_sim * pool_sim +
@@ -195,10 +197,9 @@ def _recommend_genre_priority(
 
     pool["_score"] = score
 
-    # A) Selección: nos quedamos con los mejores por score (relevancia)
     pool = pool.sort_values(by=["_score"], ascending=False).head(final_n).copy()
 
-    # B) ORDEN FINAL (lo que se muestra): por Clasificacion y votes
+    # Orden final (lo que se muestra)
     pool = pool.sort_values(by=["Clasificacion"], ascending=False)
 
     return pool.drop(columns=["_score"])
@@ -211,19 +212,14 @@ _mlb, _G = _build_genre_matrix(df)
 
 st.markdown("""
     <style>
-    /* Fondo general y color de texto */
     .stApp {
         background-color: #141414;
         color: white;
     }
-    
-    /* Títulos y fuentes */
     h1, h2, h3 {
-        color: #E50914 !important; /* Rojo Netflix */
+        color: #E50914 !important;
         font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
     }
-
-    /* Botones estilo Netflix */
     .stButton>button {
         background-color: #E50914 !important;
         color: white !important;
@@ -231,42 +227,29 @@ st.markdown("""
         border-radius: 4px !important;
         font-weight: bold !important;
     }
-    
-    /* Espaciado para Modelos 1 y 2 */
     .netflix-spacer {
         margin-top: 0px;
     }
-
-    /* Ajustes para la Sidebar */
     section[data-testid="stSidebar"] {
         background-color: #000000 !important;
     }
-    
-    /* --- MANTENIMIENTO DE ESTRUCTURA COLUMNAS MATCH --- */
     [data-testid="stHorizontalBlock"] {
         gap: 20px !important;
     }
-
-    /* Columnas 1 y 4: 20px más pequeñas mediante padding */
     [data-testid="column"]:nth-of-type(1), 
     [data-testid="column"]:nth-of-type(4) {
         flex: 1.1 1 0% !important;
         padding-left: 25px !important;
         padding-right: 25px !important;
     }
-    
-    /* Columnas 2 y 3: Más grandes */
     [data-testid="column"]:nth-of-type(2), 
     [data-testid="column"]:nth-of-type(3) {
         flex: 1 1 0% !important;
         padding-left: 15px !important;
         padding-right: 15px !important;
     }
-
     .rec-title { font-size: 0.9rem !important; font-weight: bold; color: white; }
     .rec-info { font-size: 0.8rem !important; color: #bbb; }
-    
-    /* Estilo para los inputs */
     .stSelectbox, .stMultiSelect, .stSlider {
         color: white !important;
     }
@@ -279,9 +262,8 @@ if "current_item" not in st.session_state: st.session_state.current_item = None
 if "liked_genres" not in st.session_state: st.session_state.liked_genres = set()
 if "last_match" not in st.session_state: st.session_state.last_match = None
 
-# ✅ NUEVO: estado para personalizar el "tinder" en base a likes
 if "swipe_count" not in st.session_state: st.session_state.swipe_count = 0
-if "liked_titles" not in st.session_state: st.session_state.liked_titles = []  # títulos con 💚
+if "liked_titles" not in st.session_state: st.session_state.liked_titles = []
 
 
 st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/0/08/Netflix_2015_logo.svg", width=150)
@@ -291,12 +273,15 @@ page = st.sidebar.radio(
     ["Recomendación por gustos", "Recomendación por Usuario", "Recomendación por Match"]
 )
 
+# =========================
+# MODELO 1: Recomendación por gustos (SIN FILTROS)
+# =========================
 if page == "Recomendación por gustos":
     st.markdown('<div class="netflix-spacer"></div>', unsafe_allow_html=True)
     st.title("Sistema de Recomendación por Gustos")
 
     content_type = st.selectbox("¿Qué quieres ver?", ["Pelicula", "Serie"])
-    
+
     all_genres = set()
     for g in df["Genero"].dropna():
         for genre in g.split(","):
@@ -306,25 +291,19 @@ if page == "Recomendación por gustos":
     user_min_duration = st.slider("Duración mínima (minutos)", 30, 240, 50)
 
     if st.button("Get recommendations"):
-        filtered = df[df["Tipo"] == content_type]
-        if user_genres:
-            pattern = "|".join(user_genres)
-            filtered = filtered[filtered["Genero"].str.contains(pattern, case=False, na=False)]
-        
-        if content_type == "Pelicula":
-            filtered = filtered[filtered["duration_min"] >= user_min_duration]
-            
+        # Antes: filtrabas por tipo/género/duración.
+        # Ahora: NO recortamos el dataset -> la IA rankea sobre todo el catálogo.
         q_vec = _embed_query(user_genres, content_type, _vectorizer, _scaler, _svd)
 
         recs = _recommend_genre_priority(
-            filtered,
-            _ITEM_EMB[filtered.index],
+            df,
+            _ITEM_EMB,
             q_vec,
             _mlb,
-            _G[filtered.index],
+            _G,
             user_genres,
             final_n=10,
-            pool_size=400
+            pool_size=800
         )
 
         st.subheader("Títulos recomendados:")
@@ -337,6 +316,9 @@ if page == "Recomendación por gustos":
                 st.write(f"⭐ **Clasificación:** {row['Clasificacion']}")
             st.divider()
 
+# =========================
+# MODELO 2: Recomendación por Usuario (SIN FILTROS DE TIPO/GÉNERO)
+# =========================
 elif page == "Recomendación por Usuario":
     st.markdown('<div class="netflix-spacer"></div>', unsafe_allow_html=True)
     st.title("Recomendación basada en tu historial")
@@ -347,14 +329,14 @@ elif page == "Recomendación por Usuario":
     if username and watched_titles:
         st.success(f"{username}, analizando tu historial...")
         watched_df = df[df["Titulo"].isin(watched_titles)]
+
         genres_watched = set()
         for g in watched_df["Genero"].dropna():
             for genre in g.split(","):
                 genres_watched.add(genre.strip())
-        
-        preferred_type = watched_df["Tipo"].mode()[0]
-        pattern = "|".join(genres_watched) if genres_watched else ""
-        
+
+        preferred_type = watched_df["Tipo"].mode()[0] if not watched_df.empty else "Pelicula Serie"
+
         watched_idx = df[df["Titulo"].isin(watched_titles)].index
         if len(watched_idx) > 0:
             user_vec = _ITEM_EMB[watched_idx].mean(axis=0)
@@ -362,12 +344,8 @@ elif page == "Recomendación por Usuario":
         else:
             user_vec = _embed_query(genres_watched, preferred_type, _vectorizer, _scaler, _svd)
 
-        candidate_mask = (
-            (df["Tipo"] == preferred_type) &
-            (~df["Titulo"].isin(watched_titles)) &
-            (df["Genero"].str.contains(pattern, case=False, na=False) if pattern else True)
-        )
-
+        # Antes: candidate_mask filtraba por tipo y por géneros.
+        # Ahora: NO filtramos -> solo excluimos lo ya visto.
         recommendations = _recommend_genre_priority(
             df,
             _ITEM_EMB,
@@ -376,9 +354,9 @@ elif page == "Recomendación por Usuario":
             _G,
             list(genres_watched),
             final_n=10,
-            pool_size=500,
+            pool_size=800,
             exclude_titles=set(watched_titles),
-            filter_mask=candidate_mask
+            filter_mask=None
         )
 
         for _, row in recommendations.iterrows():
@@ -390,10 +368,13 @@ elif page == "Recomendación por Usuario":
                 st.write(f"⭐ **Clasificación:** {row['Clasificacion']}")
             st.divider()
 
+# =========================
+# MODELO 3: Recomendación por Match
+# =========================
 elif page == "Recomendación por Match":
     st.markdown("<h2 style='text-align: center;'>Recomendación por Match</h2>", unsafe_allow_html=True)
 
-    # ✅ NUEVO: a partir de 5 swipes, elegir siguiente item por similitud a los LIKES
+    # A partir de 5 swipes, elegir siguiente item por similitud a los LIKES
     def get_new_item():
         available = df[~df["Titulo"].isin(st.session_state.shown_titles)]
         if available.empty:
@@ -423,7 +404,6 @@ elif page == "Recomendación por Match":
                 best_idx = int(cand_idx[best_local])
                 return df.loc[best_idx]
 
-        # Si no hay likes todavía, seguimos aleatorio
         return available.sample(1).iloc[0]
 
     if st.session_state.current_item is None:
@@ -473,23 +453,20 @@ elif page == "Recomendación por Match":
 
     with c2:
         st.markdown("<h3 style='text-align: center;'>Populares</h3>", unsafe_allow_html=True)
-        if st.session_state.liked_genres:
-            pattern = "|".join(st.session_state.liked_genres)
+        if st.session_state.liked_titles:
+            # Perfil a partir de likes (más “IA”)
+            idxs = []
+            for t in st.session_state.liked_titles[-10:]:
+                found = df.index[df["Titulo"] == t]
+                if len(found) > 0:
+                    idxs.append(found[0])
 
-            if st.session_state.last_match is not None:
-                base_title = st.session_state.last_match["Titulo"]
-                base_idx = df.index[df["Titulo"] == base_title]
-                base_vec = _ITEM_EMB[base_idx[0]] if len(base_idx) > 0 else _embed_query(
-                    st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd
-                )
-            else:
-                base_vec = _embed_query(st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd)
-
-            cand_mask = (
-                (df["Genero"].str.contains(pattern, case=False, na=False)) &
-                (~df["Titulo"].isin(exclude)) &
-                (df["votes"] >= 350)
+            base_vec = _l2_normalize(_ITEM_EMB[idxs].mean(axis=0)) if idxs else _embed_query(
+                st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd
             )
+
+            # Mantengo solo la idea de "popular" por votos (si quieres quitarlo, dímelo)
+            cand_mask = (df["votes"] >= 350) & (~df["Titulo"].isin(exclude))
 
             recs = _recommend_genre_priority(
                 df,
@@ -499,7 +476,7 @@ elif page == "Recomendación por Match":
                 _G,
                 list(st.session_state.liked_genres),
                 final_n=5,
-                pool_size=400,
+                pool_size=800,
                 exclude_titles=set(exclude),
                 filter_mask=cand_mask
             )
@@ -509,23 +486,19 @@ elif page == "Recomendación por Match":
 
     with c3:
         st.markdown("<h3 style='text-align: center;'>Joyas Desconicidas</h3>", unsafe_allow_html=True)
-        if st.session_state.liked_genres:
-            pattern = "|".join(st.session_state.liked_genres)
+        if st.session_state.liked_titles:
+            idxs = []
+            for t in st.session_state.liked_titles[-10:]:
+                found = df.index[df["Titulo"] == t]
+                if len(found) > 0:
+                    idxs.append(found[0])
 
-            if st.session_state.last_match is not None:
-                base_title = st.session_state.last_match["Titulo"]
-                base_idx = df.index[df["Titulo"] == base_title]
-                base_vec = _ITEM_EMB[base_idx[0]] if len(base_idx) > 0 else _embed_query(
-                    st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd
-                )
-            else:
-                base_vec = _embed_query(st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd)
-
-            cand_mask = (
-                (df["Genero"].str.contains(pattern, case=False, na=False)) &
-                (~df["Titulo"].isin(exclude)) &
-                (df["votes"] < 350)
+            base_vec = _l2_normalize(_ITEM_EMB[idxs].mean(axis=0)) if idxs else _embed_query(
+                st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd
             )
+
+            # Mantengo solo la idea de "joya" por votos (si quieres quitarlo, dímelo)
+            cand_mask = (df["votes"] < 350) & (~df["Titulo"].isin(exclude))
 
             recs = _recommend_genre_priority(
                 df,
@@ -535,7 +508,7 @@ elif page == "Recomendación por Match":
                 _G,
                 list(st.session_state.liked_genres),
                 final_n=5,
-                pool_size=400,
+                pool_size=800,
                 exclude_titles=set(exclude),
                 filter_mask=cand_mask
             )
