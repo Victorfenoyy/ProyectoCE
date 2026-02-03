@@ -62,6 +62,7 @@ def _train_recommender_model(df_in: pd.DataFrame):
     svd = TruncatedSVD(n_components=n_components, random_state=42)
     X_latent = svd.fit_transform(X)
 
+    # Normalización L2 (para coseno)
     norms = np.linalg.norm(X_latent, axis=1, keepdims=True) + 1e-9
     X_latent = X_latent / norms
 
@@ -173,7 +174,6 @@ def _recommend_genre_priority(
         overlap = (G[pool_idx] @ q_vec_bin).astype(float)
 
         if q_len == 1:
-            # clave: no penaliza tener más géneros
             genre_score = (overlap > 0).astype(float)
         else:
             coverage = overlap / q_len
@@ -278,6 +278,10 @@ if "shown_titles" not in st.session_state: st.session_state.shown_titles = []
 if "current_item" not in st.session_state: st.session_state.current_item = None
 if "liked_genres" not in st.session_state: st.session_state.liked_genres = set()
 if "last_match" not in st.session_state: st.session_state.last_match = None
+
+# ✅ NUEVO: estado para personalizar el "tinder" en base a likes
+if "swipe_count" not in st.session_state: st.session_state.swipe_count = 0
+if "liked_titles" not in st.session_state: st.session_state.liked_titles = []  # títulos con 💚
 
 
 st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/0/08/Netflix_2015_logo.svg", width=150)
@@ -389,15 +393,45 @@ elif page == "Recomendación por Usuario":
 elif page == "Recomendación por Match":
     st.markdown("<h2 style='text-align: center;'>Recomendación por Match</h2>", unsafe_allow_html=True)
 
+    # ✅ NUEVO: a partir de 5 swipes, elegir siguiente item por similitud a los LIKES
     def get_new_item():
         available = df[~df["Titulo"].isin(st.session_state.shown_titles)]
-        return available.sample(1).iloc[0] if not available.empty else None
+        if available.empty:
+            return None
+
+        # Primeras 5: exploración aleatoria
+        if st.session_state.swipe_count < 5:
+            return available.sample(1).iloc[0]
+
+        # A partir de 5: si hay likes, perfil con likes
+        if len(st.session_state.liked_titles) > 0:
+            like_titles = st.session_state.liked_titles[-10:]  # últimos 10 likes
+            idxs = []
+            for t in like_titles:
+                found = df.index[df["Titulo"] == t]
+                if len(found) > 0:
+                    idxs.append(found[0])
+
+            if len(idxs) > 0:
+                profile_vec = _ITEM_EMB[idxs].mean(axis=0)
+                profile_vec = _l2_normalize(profile_vec)
+
+                cand_idx = available.index.values
+                sims = _ITEM_EMB[cand_idx] @ profile_vec
+
+                best_local = int(np.argmax(sims))
+                best_idx = int(cand_idx[best_local])
+                return df.loc[best_idx]
+
+        # Si no hay likes todavía, seguimos aleatorio
+        return available.sample(1).iloc[0]
 
     if st.session_state.current_item is None:
         st.session_state.current_item = get_new_item()
 
     item = st.session_state.current_item
     c1, c2, c3, c4 = st.columns([1.1, 1, 1, 1.1])
+
     with c1:
         st.markdown("<h3 style='text-align: center;'></h3>", unsafe_allow_html=True)
         if item is not None:
@@ -405,11 +439,17 @@ elif page == "Recomendación por Match":
             st.markdown(f"**{item['Titulo']}**")
             st.caption(f"🎭 {item['Genero']} | ⭐ {item['Clasificacion']}")
             cx, cv = st.columns(2)
+
             if cx.button("❌", key="x_btn", use_container_width=True):
+                st.session_state.swipe_count += 1
                 st.session_state.shown_titles.append(item["Titulo"])
                 st.session_state.current_item = get_new_item()
                 st.rerun()
+
             if cv.button("💚", key="v_btn", use_container_width=True):
+                st.session_state.swipe_count += 1
+                st.session_state.liked_titles.append(item["Titulo"])
+
                 st.session_state.last_match = item
                 st.session_state.liked_genres = set([g.strip() for g in str(item["Genero"]).split(",")])
                 st.session_state.shown_titles.append(item["Titulo"])
