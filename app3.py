@@ -199,7 +199,7 @@ def _recommend_genre_priority(
     pool = pool.sort_values(by=["_score"], ascending=False).head(final_n).copy()
 
     # B) ORDEN FINAL (lo que se muestra): por Clasificacion y votes
-    pool = pool.sort_values(by=["Clasificacion", "votes"], ascending=False)
+    pool = pool.sort_values(by=["Clasificacion"], ascending=False)
 
     return pool.drop(columns=["_score"])
 
