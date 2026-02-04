@@ -17,7 +17,7 @@ df["duration_min"] = df["Duracion"].str.replace(" min", "", regex=False).astype(
 df["Tipo"] = df["Tipo"].str.strip()
 
 # =========================
-# Modelo de IA (entrenado) para recomendaciones
+# Modelo de IA para recomendaciones
 # =========================
 import numpy as np
 
@@ -138,10 +138,10 @@ def _recommend_genre_priority(
     if exclude_titles is None:
         exclude_titles = set()
 
-    # 1) Similitud coseno (porque embeddings están normalizados)
+    
     sims_all = item_embeddings @ user_vec
 
-    # 2) Máscara válida (solo para excluir títulos vistos / mostrados)
+   
     valid = np.ones(len(df_in), dtype=bool)
     if exclude_titles:
         valid &= ~df_in["Titulo"].isin(list(exclude_titles)).values
@@ -151,7 +151,7 @@ def _recommend_genre_priority(
     sims_masked = sims_all.copy()
     sims_masked[~valid] = -1e9
 
-    # 3) Pool TOP-K por similitud (acelera y mantiene relevancia)
+    
     k = int(min(pool_size, int(np.sum(valid)))) if np.sum(valid) > 0 else 0
     if k <= 0:
         return df_in.head(0)
@@ -159,7 +159,7 @@ def _recommend_genre_priority(
     pool_idx = np.argsort(-sims_masked)[:k]
     pool = df_in.iloc[pool_idx].copy()
 
-    # 4) Score de géneros
+    
     q = [str(g).strip().lower() for g in (query_genres or []) if str(g).strip()]
     q_vec_bin = np.zeros(len(mlb.classes_), dtype=np.int8)
     class_to_i = {c: i for i, c in enumerate(mlb.classes_)}
@@ -182,12 +182,12 @@ def _recommend_genre_priority(
             exact = (overlap == q_len).astype(float)
             genre_score = coverage + 0.25 * exact
 
-    # 5) Normalizaciones (para mezclar señales)
+    
     pool_sim = _minmax(sims_all[pool_idx])
     pool_rating = _minmax(pool["Clasificacion"].fillna(0).astype(float).values)
     pool_votes = _minmax(np.log1p(pool["votes"].fillna(0).astype(float).values))
 
-    # 6) Score final (selección TOP relevante)
+  
     score = (
         w_genre * genre_score +
         w_sim * pool_sim +
@@ -199,13 +199,13 @@ def _recommend_genre_priority(
 
     pool = pool.sort_values(by=["_score"], ascending=False).head(final_n).copy()
 
-    # Orden final (lo que se muestra)
+
     pool = pool.sort_values(by=["Clasificacion"], ascending=False)
 
     return pool.drop(columns=["_score"])
 
 
-# Entrenamos modelo y matriz de géneros (cacheado)
+
 _vectorizer, _scaler, _svd, _ITEM_EMB = _train_recommender_model(df)
 _mlb, _G = _build_genre_matrix(df)
 
@@ -274,7 +274,7 @@ page = st.sidebar.radio(
 )
 
 # =========================
-# MODELO 1: Recomendación por gustos (SIN FILTROS)
+# MODELO 1: Recomendación por gustos
 # =========================
 if page == "Recomendación por gustos":
     st.markdown('<div class="netflix-spacer"></div>', unsafe_allow_html=True)
@@ -291,8 +291,7 @@ if page == "Recomendación por gustos":
     user_min_duration = st.slider("Duración mínima (minutos)", 30, 240, 50)
 
     if st.button("Get recommendations"):
-        # Antes: filtrabas por tipo/género/duración.
-        # Ahora: NO recortamos el dataset -> la IA rankea sobre todo el catálogo.
+       
         q_vec = _embed_query(user_genres, content_type, _vectorizer, _scaler, _svd)
 
         recs = _recommend_genre_priority(
@@ -317,7 +316,7 @@ if page == "Recomendación por gustos":
             st.divider()
 
 # =========================
-# MODELO 2: Recomendación por Usuario (SIN FILTROS DE TIPO/GÉNERO)
+# MODELO 2: Recomendación por Usuario 
 # =========================
 elif page == "Recomendación por Usuario":
     st.markdown('<div class="netflix-spacer"></div>', unsafe_allow_html=True)
@@ -344,8 +343,7 @@ elif page == "Recomendación por Usuario":
         else:
             user_vec = _embed_query(genres_watched, preferred_type, _vectorizer, _scaler, _svd)
 
-        # Antes: candidate_mask filtraba por tipo y por géneros.
-        # Ahora: NO filtramos -> solo excluimos lo ya visto.
+        
         recommendations = _recommend_genre_priority(
             df,
             _ITEM_EMB,
@@ -374,19 +372,19 @@ elif page == "Recomendación por Usuario":
 elif page == "Recomendación por Match":
     st.markdown("<h2 style='text-align: center;'>Recomendación por Match</h2>", unsafe_allow_html=True)
 
-    # A partir de 5 swipes, elegir siguiente item por similitud a los LIKES
+  
     def get_new_item():
         available = df[~df["Titulo"].isin(st.session_state.shown_titles)]
         if available.empty:
             return None
 
-        # Primeras 5: exploración aleatoria
+       
         if st.session_state.swipe_count < 5:
             return available.sample(1).iloc[0]
 
-        # A partir de 5: si hay likes, perfil con likes
+        
         if len(st.session_state.liked_titles) > 0:
-            like_titles = st.session_state.liked_titles[-10:]  # últimos 10 likes
+            like_titles = st.session_state.liked_titles[-10:]  
             idxs = []
             for t in like_titles:
                 found = df.index[df["Titulo"] == t]
@@ -497,7 +495,6 @@ elif page == "Recomendación por Match":
                 st.session_state.liked_genres, "Pelicula Serie", _vectorizer, _scaler, _svd
             )
 
-            # Mantengo solo la idea de "joya" por votos (si quieres quitarlo, dímelo)
             cand_mask = (df["votes"] < 350) & (~df["Titulo"].isin(exclude))
 
             recs = _recommend_genre_priority(
